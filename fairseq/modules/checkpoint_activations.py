@@ -6,11 +6,12 @@
 from typing import Any, Dict, List, Tuple, Union
 
 import torch
+import torch.utils.checkpoint as checkpoint
 
 from fairseq import utils
 
 
-def checkpoint_wrapper(m):
+def checkpoint_wrapper(m, offload_to_cpu=False):
     """
     A friendlier wrapper for performing activation checkpointing.
 
@@ -21,7 +22,7 @@ def checkpoint_wrapper(m):
 
     Usage::
 
-        checkpointed_module = checkpoint_wrapper(my_module)
+        checkpointed_module = checkpoint_wrapper(my_module, offload_to_cpu=True)
         a, b = checkpointed_module(x, y=3, z=torch.Tensor([1]))
     """
     original_forward = m.forward
@@ -31,7 +32,7 @@ def checkpoint_wrapper(m):
         # the backward must return gradients (or None) for every input argument.
         # We can flatten keyword arguments to make this easier.
         kwarg_keys, flat_args = pack_kwargs(*args, **kwargs)
-        parent_ctx_dict = {}
+        parent_ctx_dict = {"offload": offload_to_cpu}
         output = CheckpointFunction.apply(
             original_forward, parent_ctx_dict, kwarg_keys, *flat_args
         )
@@ -88,7 +89,6 @@ def split_non_tensors(
     """
     if isinstance(mixed, torch.Tensor):
         return (mixed,), None
-    assert isinstance(mixed, tuple)
     tensors = []
     packed_non_tensors = {"is_tensor": [], "objects": []}
     for o in mixed:
@@ -134,13 +134,21 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, run_function, parent_ctx_dict, kwarg_keys, *args):
         if torch.is_grad_enabled():  # grad may be disabled, e.g., during validation
-            torch.utils.checkpoint.check_backward_validity(args)
+            checkpoint.check_backward_validity(args)
 
         ctx.run_function = run_function
         ctx.kwarg_keys = kwarg_keys
         ctx.fwd_rng_state = utils.get_rng_state()
 
         tensor_inputs, packed_non_tensor_inputs = split_non_tensors(args)
+        if parent_ctx_dict["offload"]:
+            ctx.fwd_device = tuple(x.device for x in tensor_inputs)
+            ctx.grad_requirements = tuple(x.requires_grad for x in tensor_inputs)
+            tensor_inputs = tuple(x.cpu() for x in tensor_inputs)
+
+        else:
+            ctx.fwd_device, ctx.grad_requirements = None, None
+
         ctx.save_for_backward(*tensor_inputs)
         ctx.packed_non_tensor_inputs = packed_non_tensor_inputs
 
@@ -151,7 +159,6 @@ class CheckpointFunction(torch.autograd.Function):
         if isinstance(outputs, torch.Tensor):
             return outputs
         else:
-            assert isinstance(outputs, tuple)
             # Autograd Functions don't like non-Tensor outputs. We can split the
             # non-Tensor and Tensor outputs, returning the former by reference
             # through *parent_ctx_dict* and returning the latter directly.
@@ -166,8 +173,14 @@ class CheckpointFunction(torch.autograd.Function):
                 "Checkpointing is not compatible with .grad(), please use .backward() if possible"
             )
 
-        tensor_inputs = ctx.saved_tensors
-        tensor_inputs = torch.utils.checkpoint.detach_variable(tensor_inputs)
+        tensor_inputs: Tuple = ctx.saved_tensors
+        tensor_inputs = checkpoint.detach_variable(tensor_inputs)
+        if ctx.fwd_device is not None:
+            tensor_inputs = [
+                t.to(ctx.fwd_device[i]) for i, t in enumerate(tensor_inputs)
+            ]
+            for i, need_grad in enumerate(ctx.grad_requirements):
+                tensor_inputs[i].requires_grad = need_grad
         inputs = unpack_non_tensors(tensor_inputs, ctx.packed_non_tensor_inputs)
 
         # Store the current states.
@@ -180,7 +193,6 @@ class CheckpointFunction(torch.autograd.Function):
             unpacked_args, unpacked_kwargs = unpack_kwargs(ctx.kwarg_keys, inputs)
             outputs = ctx.run_function(*unpacked_args, **unpacked_kwargs)
             tensor_outputs, _ = split_non_tensors(outputs)
-
         # Set the states back to what it was at the start of this function.
         utils.set_rng_state(bwd_rng_state)
 

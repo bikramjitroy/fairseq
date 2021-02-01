@@ -14,15 +14,13 @@ This version also supports the *no_sync* context manager, which allows faster
 training with `--update-freq`.
 """
 
-import copy
 from collections import OrderedDict
 from contextlib import contextmanager
 
 import torch
 from torch import nn
-from torch.autograd import Variable
 
-from . import distributed_utils
+from fairseq.distributed import utils
 
 
 class LegacyDistributedDataParallel(nn.Module):
@@ -34,20 +32,18 @@ class LegacyDistributedDataParallel(nn.Module):
 
     Args:
         module (~torch.nn.Module): module to be parallelized
-        world_size (int): number of parallel workers
-        process_group (optional): the c10d process group to be used for
-            distributed data all-reduction. If None, the default process group
-            will be used.
+        process_group: the c10d process group to be used for distributed data
+            parallel all-reduction.
         buffer_size (int, optional): number of elements to buffer before
             performing all-reduce (default: 256M).
     """
 
-    def __init__(self, module, world_size, process_group=None, buffer_size=2 ** 28):
+    def __init__(self, module, process_group, buffer_size=2 ** 28):
         super().__init__()
 
         self.module = module
-        self.world_size = world_size
         self.process_group = process_group
+        self.world_size = utils.get_world_size(self.process_group)
 
         # Never use a bigger buffer than the number of model params
         self.buffer_size = min(buffer_size, sum(p.numel() for p in module.parameters()))
@@ -66,13 +62,6 @@ class LegacyDistributedDataParallel(nn.Module):
             paramlists[device] += [param]
         self.per_device_params = list(paramlists.values())
 
-    def __getstate__(self):
-        attrs = copy.copy(self.__dict__)
-        return attrs
-
-    def __setstate__(self, state):
-        super().__setstate__(state)
-
     @contextmanager
     def no_sync(self):
         """A context manager to disable gradient synchronization."""
@@ -84,7 +73,7 @@ class LegacyDistributedDataParallel(nn.Module):
     def forward(self, *inputs, **kwargs):
         return self.module(*inputs, **kwargs)
 
-    def all_reduce(self):
+    def all_reduce_grads(self):
         """
         This function must be called explicitly after backward to reduce
         gradients. There is no automatic hook like c10d.
@@ -118,7 +107,7 @@ class LegacyDistributedDataParallel(nn.Module):
             if nonzero_buffer:
                 buffer.div_(self.world_size)
 
-            distributed_utils.all_reduce(buffer, self.process_group)
+            utils.all_reduce(buffer, self.process_group)
 
             # copy all-reduced grads back into their original place
             offset = 0

@@ -401,7 +401,21 @@ class RobertaEncoder(FairseqEncoder):
         if args.encoder_layers_to_keep:
             args.encoder_layers = len(args.encoder_layers_to_keep.split(","))
 
-        self.sentence_encoder = TransformerSentenceEncoder(
+        self.sentence_encoder = self.build_encoder(args, dictionary)
+
+        self.lm_head = self.build_lm_head(
+            embed_dim=args.encoder_embed_dim,
+            output_dim=len(dictionary),
+            activation_fn=args.activation_fn,
+            weight=(
+                self.sentence_encoder.embed_tokens.weight
+                if not args.untie_weights_roberta
+                else None
+            ),
+        )
+
+    def build_encoder(self, args, dictionary):
+        return TransformerSentenceEncoder(
             padding_idx=dictionary.pad(),
             vocab_size=len(dictionary),
             num_encoder_layers=args.encoder_layers,
@@ -421,16 +435,8 @@ class RobertaEncoder(FairseqEncoder):
             qn_block_size=args.quant_noise_pq_block_size,
         )
 
-        self.lm_head = RobertaLMHead(
-            embed_dim=args.encoder_embed_dim,
-            output_dim=len(dictionary),
-            activation_fn=args.activation_fn,
-            weight=(
-                self.sentence_encoder.embed_tokens.weight
-                if not args.untie_weights_roberta
-                else None
-            ),
-        )
+    def build_lm_head(self, embed_dim, output_dim, activation_fn, weight):
+        return RobertaLMHead(embed_dim, output_dim, activation_fn, weight)
 
     def forward(
         self,
@@ -495,7 +501,6 @@ def base_architecture(args):
     args.activation_dropout = getattr(args, "activation_dropout", 0.0)
     args.pooler_dropout = getattr(args, "pooler_dropout", 0.0)
     args.encoder_layers_to_keep = getattr(args, "encoder_layers_to_keep", None)
-    args.encoder_layerdrop = getattr(args, "encoder_layerdrop", 0.0)
     args.encoder_layerdrop = getattr(args, "encoder_layerdrop", 0.0)
     args.untie_weights_roberta = getattr(args, "untie_weights_roberta", False)
     args.spectral_norm_classification_head = getattr(
